@@ -1,0 +1,11 @@
+{
+  "name": "curriculo-ia",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Servidor do Currículo IA: contas por código de e-mail, rascunhos e lista de contatos (sem dependências)",
+  "engines": { "node": ">=22.9" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test.js"
+  }
+}
