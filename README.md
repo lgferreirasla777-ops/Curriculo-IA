@@ -60,6 +60,17 @@ Vendas: logado como administrador, `/api/admin/stats` mostra vendas e faturament
 
 **Limite importante:** o PDF ainda é gerado no navegador do cliente. O servidor controla quando o botão aparece, o que impede o uso normal sem pagar, mas alguém que saiba mexer no código da página ainda consegue gerar o PDF sem passar pelo pagamento. A trava completa exige gerar o PDF no servidor depois da confirmação (e esse PDF teria texto selecionável). É o próximo passo recomendado.
 
+## Checklist de lançamento
+
+1. Volume `/data` criado e backups ativos; `APP_SECRET` definido.
+2. Domínio próprio apontado e `BASE_URL` igual a ele (a imagem de prévia do link e o webhook dependem disso).
+3. Resend com domínio verificado: `RESEND_API_KEY` e `MAIL_FROM`. Teste criando uma conta com um e-mail seu.
+4. `LEGAL_NAME`, `CONTACT_EMAIL` (e `LEGAL_DOC`, se quiser) preenchidos, e as páginas `/privacidade` e `/termos` **revisadas por um profissional**.
+5. Mercado Pago: `MP_ACCESS_TOKEN`, webhook cadastrado, Pix de R$ 1,00 com `PRICE_CENTS=100`; depois voltar para `1000`.
+6. Abrir `/api/health`: deve mostrar `"mail":true` e `"pay":true`.
+7. Conferir `/api/admin/stats` com o seu e-mail de administrador.
+8. Lançamento fechado com poucas pessoas conhecidas antes de divulgar no Instagram.
+
 ## Lista de contatos
 Logado com um e-mail de `ADMIN_EMAILS`, abra no navegador:
 - `/api/admin/contacts.csv` → só quem aceitou receber novidades (use esta para divulgação).

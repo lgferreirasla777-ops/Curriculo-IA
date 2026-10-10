@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict'), os = require('node:os'), path = require('node:path'), fs = require('node:fs');
 process.env.DB_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cia-')), 't.db');
-process.env.ADMIN_EMAILS = 'admin@teste.com';
+process.env.ADMIN_EMAILS = 'admin@teste.com'; process.env.LEGAL_NAME = 'Empresa Teste <script>'; process.env.CONTACT_EMAIL = 'contato@teste.com'; process.env.BASE_URL = 'https://site.teste';
 process.env.APP_SECRET = 'segredo-de-teste-com-mais-de-24-chars';
 fs.mkdirSync(path.join(__dirname, 'public'), { recursive: true });
 const fake = require('./fake-mp.js');
@@ -125,4 +125,11 @@ test('pagamento: administrador vê vendas e faturamento', async () => {
   const adm = await entrar('admin@teste.com', false), s = (await call('GET', '/api/admin/stats', null, adm.ck)).j;
   assert.ok(s.vendas >= 2); assert.equal(s.faturamento_centavos % 1000, 0);
   const l = await call('GET', '/api/admin/orders', null, adm.ck); assert.equal(l.s, 200); assert.ok(l.j.length >= 5);
+});
+
+test('páginas legais e prévia do link', async () => {
+  const p = await call('GET', '/privacidade'); assert.equal(p.s, 200); assert.match(p.t, /LGPD/); assert.match(p.t, /contato@teste.com/); assert.doesNotMatch(p.t, /<script>/);
+  assert.equal((await call('GET', '/termos')).s, 200);
+  fs.writeFileSync(path.join(__dirname, 'public', 'index.html'), fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8'));
+  const i = await call('GET', '/'); assert.equal(i.s, 200); assert.doesNotMatch(i.t, /%%BASE%%/); assert.match(i.t, /https:\/\/site.teste\/og.png/);
 });

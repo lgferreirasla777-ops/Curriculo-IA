@@ -92,13 +92,67 @@ function ordOf(req, id) {
   const o = getOrder(String(id || '')), t = req.headers['x-order-token'];
   return o && typeof t === 'string' && /^[a-f0-9]{64}$/.test(t) && same(o.token_hash, H(t)) ? o : null;
 }
+
+// ---------- Páginas legais (modelo inicial; revise com um profissional antes de divulgar) ----------
+const escH = v => String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const LEGAL = escH(env.LEGAL_NAME || '[preencha LEGAL_NAME]'), CONTACT = escH(env.CONTACT_EMAIL || '[preencha CONTACT_EMAIL]'), LDOC = env.LEGAL_DOC ? ' (' + escH(env.LEGAL_DOC) + ')' : '';
+if (PROD && !(env.LEGAL_NAME && env.CONTACT_EMAIL)) console.warn('AVISO: defina LEGAL_NAME e CONTACT_EMAIL; as páginas /privacidade e /termos mostram espaços em branco até lá.');
+const UPD = '10 de outubro de 2026';
+const page = (t, body) => `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${t} – Currículo IA</title><style>body{font:17px/1.65 system-ui,Arial,sans-serif;margin:0;color:#14213a;background:#fff}main{max-width:760px;margin:0 auto;padding:28px 20px 60px}h1{font-size:28px}h2{font-size:20px;margin-top:28px}a{color:#2F8FF0}.n{color:#5b6b82;font-size:15px}@media(prefers-color-scheme:dark){body{background:#0e1626;color:#e8eef8}.n{color:#9fb0c8}}</style></head><body><main><p><a href="/">← Voltar ao Currículo IA</a></p><h1>${t}</h1><p class="n">Atualizado em ${UPD}.</p>${body}</main></body></html>`;
+const PRIV = page('Política de Privacidade', `
+<p>O <b>Currículo IA</b> é operado por <b>${LEGAL}</b>${LDOC} (“nós”), que é o controlador dos seus dados pessoais. Contato para assuntos de privacidade: <a href="mailto:${CONTACT}">${CONTACT}</a>.</p>
+<h2>1. Quais dados tratamos</h2>
+<p><b>Dados do currículo</b>, que você digita: nome, telefone, WhatsApp, e-mail, cidade, endereço (opcional), objetivo, resumo, experiências, escolaridade, cursos, habilidades e foto (opcional). Pedimos só o necessário e nunca CPF ou RG.<br><b>Dados de conta</b>: seu e-mail, a data do seu aceite desta política e, se você marcar, a sua preferência de receber novidades.<br><b>Dados de pagamento</b>: o pagamento por Pix é processado pelo Mercado Pago. Guardamos o seu e-mail, o valor e o identificador do pagamento; não temos acesso a dados de cartão nem à sua conta bancária.<br><b>Dados técnicos</b>: o endereço de IP é usado para limitar abusos e proteger o serviço.</p>
+<h2>2. Para que usamos</h2>
+<p>Montar e entregar o seu currículo; guardar o seu rascunho na sua conta; confirmar o pagamento e liberar o download; enviar o código de acesso por e-mail; prevenir fraudes e abusos; e, <b>só se você marcou essa opção</b>, enviar novidades e promoções. Você pode retirar esse consentimento quando quiser.</p>
+<h2>3. Bases legais</h2>
+<p>Execução do serviço que você contratou, cumprimento de obrigações legais, legítimo interesse para segurança do serviço e, para novidades e promoções, o seu consentimento.</p>
+<h2>4. Com quem compartilhamos</h2>
+<p>Apenas com prestadores necessários ao serviço: Mercado Pago (pagamentos), Resend (envio de e-mails) e Railway (hospedagem). Esses prestadores podem processar dados em outros países. Não vendemos seus dados.</p>
+<h2>5. Cookies e armazenamento no navegador</h2>
+<p>Usamos um cookie essencial para manter você conectado à conta e armazenamento do navegador para guardar o rascunho neste aparelho. Não usamos cookies de publicidade.</p>
+<h2>6. Por quanto tempo guardamos</h2>
+<p>O rascunho e a conta ficam guardados enquanto a conta existir; você pode excluí-la a qualquer momento pelo botão “Excluir minha conta”, o que apaga o rascunho. Registros de pagamento podem ser mantidos pelo tempo necessário para cumprir obrigações legais e fiscais.</p>
+<h2>7. Seus direitos</h2>
+<p>Pela LGPD você pode pedir confirmação de que tratamos seus dados, acesso, correção, anonimização ou eliminação, portabilidade, informação sobre compartilhamentos e revogação do consentimento. Escreva para <a href="mailto:${CONTACT}">${CONTACT}</a>. Você também pode reclamar à Autoridade Nacional de Proteção de Dados (ANPD).</p>
+<h2>8. Segurança</h2>
+<p>Adotamos medidas como conexão criptografada, códigos de acesso de uso único, limites de tentativas e acesso restrito aos dados. Nenhum sistema é 100% seguro, e por isso recomendamos não incluir no currículo dados que você não queira divulgar.</p>
+<h2>9. Menores de 18 anos</h2>
+<p>Se você tem menos de 18 anos, peça a um responsável para ajudar a usar o serviço.</p>
+<h2>10. Mudanças</h2>
+<p>Podemos atualizar esta política. A data de atualização fica no início da página.</p>`);
+const TERMS = page('Termos de Uso', `
+<p>Ao usar o <b>Currículo IA</b>, operado por <b>${LEGAL}</b>${LDOC}, você concorda com estes termos. Dúvidas: <a href="mailto:${CONTACT}">${CONTACT}</a>.</p>
+<h2>1. O serviço</h2>
+<p>O Currículo IA ajuda você a montar um currículo em PDF a partir das informações que você mesmo preenche. Não inventamos experiências, cursos ou qualificações: o conteúdo é de sua responsabilidade e deve ser verdadeiro.</p>
+<h2>2. Preço e pagamento</h2>
+<p>O valor é de R$ 10,00 por currículo, pago por Pix. O download é liberado depois da confirmação do pagamento. Cada pedido pago permite até 3 downloads do currículo.</p>
+<h2>3. Problemas e reembolso</h2>
+<p>Se o pagamento foi confirmado e você não conseguiu baixar o currículo, fale com a gente pelo WhatsApp ou pelo e-mail acima para resolvermos. Pedidos de reembolso e o direito de arrependimento seguem a legislação de defesa do consumidor aplicável.</p>
+<h2>4. Uso adequado</h2>
+<p>Não use o serviço para conteúdo ilegal, ofensivo ou de terceiros sem autorização, nem tente burlar o pagamento ou prejudicar o funcionamento do site.</p>
+<h2>5. Sem garantia de resultado</h2>
+<p>O currículo é uma ferramenta de apresentação. Não garantimos entrevistas, contratações ou que o arquivo seja aceito por todos os sistemas de candidatura.</p>
+<h2>6. Disponibilidade</h2>
+<p>Buscamos manter o serviço sempre no ar, mas ele pode ficar indisponível para manutenção ou por falhas de terceiros.</p>
+<h2>7. Dados pessoais</h2>
+<p>O tratamento dos seus dados está descrito na <a href="/privacidade">Política de Privacidade</a>.</p>
+<h2>8. Mudanças e foro</h2>
+<p>Podemos alterar estes termos, e a versão vigente é a publicada nesta página. Aplicam-se as leis brasileiras.</p>`);
+const html = (res, body) => { res.writeHead(200, { ...HEAD, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' }); res.end(body); };
 const isAdmin = u => !!u && ADMINS.includes(u.email);
 
 async function handle(req, res) {
   const url = new URL(req.url, 'http://x'), p = url.pathname, m = req.method;
   if (m === 'GET' && (p === '/' || p === '/index.html')) {
     const f = path.join(__dirname, 'public', 'index.html');
-    res.writeHead(200, { ...HEAD, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' }); return res.end(fs.readFileSync(f));
+    return html(res, fs.readFileSync(f, 'utf8').split('%%BASE%%').join(BASE));
+  }
+  if (m === 'GET' && p === '/privacidade') return html(res, PRIV);
+  if (m === 'GET' && p === '/termos') return html(res, TERMS);
+  if (m === 'GET' && p === '/og.png') {
+    const f = path.join(__dirname, 'public', 'og.png'); if (!fs.existsSync(f)) return send(res, 404, { erro: 'Não encontrado.' });
+    res.writeHead(200, { ...HEAD, 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' }); return res.end(fs.readFileSync(f));
   }
   if (!p.startsWith('/api/')) return send(res, 404, { erro: 'Não encontrado.' });
   if (m === 'GET' && p === '/api/health') return send(res, 200, { ok: true, app: 'curriculo-ia', mail: MAIL_ON, pay: !!MP_TOKEN });
