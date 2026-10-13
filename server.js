@@ -21,6 +21,16 @@ create table if not exists resumes(user_id integer primary key references users(
 create table if not exists orders(id text primary key, token_hash text not null, user_id integer, email text not null, amount_cents integer not null, status text not null, mp_id text, qr text, qr_b64 text, created_at integer not null, paid_at integer, uses_left integer not null default 0);
 create table if not exists rate(k text primary key, n integer not null, reset integer not null);`);
 
+// ---------- Backup ----------
+const BK_DIR = path.join(path.dirname(DB_PATH), 'backups');
+function snapshot() { // uma cópia por dia no próprio volume; mantém as 7 mais recentes
+  try {
+    fs.mkdirSync(BK_DIR, { recursive: true });
+    const f = path.join(BK_DIR, 'app-' + new Date().toISOString().slice(0, 10) + '.db');
+    if (!fs.existsSync(f)) db.prepare('VACUUM INTO ?').run(f);
+    fs.readdirSync(BK_DIR).filter(n => /^app-\d{4}-\d{2}-\d{2}\.db$/.test(n)).sort().slice(0, -7).forEach(n => fs.unlinkSync(path.join(BK_DIR, n)));
+  } catch (e) { console.error('backup:', e.message); }
+}
 const now = () => Date.now();
 const H = s => crypto.createHmac('sha256', SECRET).update(s).digest('hex');
 const same = (a, b) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
@@ -242,6 +252,14 @@ async function handle(req, res) {
     if (!isAdmin(u)) return send(res, 403, { erro: 'Sem permissão.' });
     if (m === 'GET' && p === '/api/admin/stats') return send(res, 200, db.prepare("select (select count(*) from users) usuarios, (select count(*) from users where news=1) aceitaram_novidades, (select count(*) from resumes) rascunhos, (select count(*) from orders where status='paid') vendas, (select coalesce(sum(amount_cents),0) from orders where status='paid') faturamento_centavos").get());
     if (m === 'GET' && p === '/api/admin/orders') return send(res, 200, db.prepare('select id,email,status,amount_cents,created_at,paid_at,uses_left from orders order by created_at desc limit 200').all());
+    if (m === 'GET' && p === '/api/admin/backup') { // baixa uma cópia consistente do banco (contém dados pessoais: guarde com cuidado)
+      if (!hit('bk:' + u.id, 6, 3600e3)) return send(res, 429, { erro: 'Muitos downloads. Tente mais tarde.' });
+      fs.mkdirSync(BK_DIR, { recursive: true });
+      const f = path.join(BK_DIR, 'dl-' + crypto.randomBytes(6).toString('hex') + '.db');
+      db.prepare('VACUUM INTO ?').run(f); const buf = fs.readFileSync(f); fs.unlinkSync(f);
+      res.writeHead(200, { ...HEAD, 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="curriculo-ia-backup-${new Date().toISOString().slice(0, 10)}.db"`, 'Cache-Control': 'no-store' });
+      return res.end(buf);
+    }
     if (m === 'GET' && p === '/api/admin/contacts.csv') {
       const all = url.searchParams.get('all') === '1';
       const rows = db.prepare('select email,created_at,news from users ' + (all ? '' : 'where news=1 ') + 'order by created_at').all();
@@ -256,6 +274,7 @@ function start(port = +env.PORT || 3000) {
   const t = now();
   const clean = () => { const x = now(); db.prepare('delete from codes where exp<?').run(x); db.prepare('delete from sessions where exp<?').run(x); db.prepare('delete from rate where reset<?').run(x); };
   clean(); setInterval(clean, 3600e3).unref();
+  snapshot(); setInterval(snapshot, 6 * 3600e3).unref();
   return new Promise(ok => srv.listen(port, () => { if (require.main === module) console.log('Currículo IA em http://localhost:' + srv.address().port); ok(srv); }));
 }
 module.exports = { start, outbox };

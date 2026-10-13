@@ -86,7 +86,7 @@ O código registra consentimento e permite excluir a conta. Ainda é preciso: **
 ## O que NÃO está pronto ou NÃO foi testado
 - **Envio real de e-mail pelo Resend**: o código está escrito, mas não foi testado com uma chave de verdade.
 - **Publicação na hospedagem**: nada foi publicado.
-- **Backup do banco**: copie o arquivo `app.db` periodicamente (com o servidor parado ou usando o backup do SQLite).
+- **Backup automático fora do servidor**: no plano Hobby da Railway não dá para criar backups (isso exige o plano Pro). O servidor guarda uma cópia por dia dentro do volume (as 7 mais recentes), o que protege contra erros e atualizações ruins, mas **não** contra a perda do próprio volume. Por isso, a cada semana, logado como administrador, abra `/api/admin/backup` para baixar uma cópia e guarde o arquivo num lugar seguro. Ele contém dados pessoais dos clientes.
 - **Pagamento real com o Mercado Pago**: o código foi testado contra um Mercado Pago simulado (`fake-mp.js`), baseado na documentação deles, mas **nunca contra o serviço de verdade**. Os nomes de campos da API podem exigir ajuste no primeiro teste real (use R$ 1,00).
 - **PDF gerado no servidor, painel visual de pedidos e envio do PDF por e-mail**: ainda não existem.
 - O recurso de IA do site usa a conta do Claude de quem visita; para todos os clientes ele precisa ser movido para este servidor, com chave da API da Anthropic guardada aqui.

@@ -133,3 +133,11 @@ test('páginas legais e prévia do link', async () => {
   fs.writeFileSync(path.join(__dirname, 'public', 'index.html'), fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8'));
   const i = await call('GET', '/'); assert.equal(i.s, 200); assert.doesNotMatch(i.t, /%%BASE%%/); assert.match(i.t, /https:\/\/site.teste\/og.png/);
 });
+
+test('backup: só administrador baixa e o arquivo é um banco SQLite válido', async () => {
+  const com = await entrar('comum@teste.com', false), adm = await entrar('admin@teste.com', false);
+  assert.equal((await call('GET', '/api/admin/backup', null, com.ck)).s, 403);
+  assert.equal((await call('GET', '/api/admin/backup')).s, 401);
+  const b = await call('GET', '/api/admin/backup', null, adm.ck); assert.equal(b.s, 200); assert.ok(b.t.startsWith('SQLite format 3'));
+  assert.ok(fs.readdirSync(path.join(path.dirname(process.env.DB_PATH), 'backups')).some(n => /^app-\d{4}-\d{2}-\d{2}\.db$/.test(n)));
+});
