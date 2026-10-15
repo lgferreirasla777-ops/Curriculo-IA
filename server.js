@@ -82,7 +82,7 @@ const csv = v => { v = String(v ?? ''); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
 async function mp(method, p, body, idem) {
   const r = await fetch(MP_API + p, { method, headers: { Authorization: 'Bearer ' + MP_TOKEN, 'Content-Type': 'application/json', ...(idem ? { 'X-Idempotency-Key': idem } : {}) }, body: body ? JSON.stringify(body) : undefined });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('mercadopago ' + r.status);
+  if (!r.ok) throw new Error('mercadopago ' + r.status + ' ' + JSON.stringify({ message: j.message, error: j.error, cause: j.cause }).slice(0, 400));
   return j;
 }
 // Nunca confiamos no conteúdo do aviso: só o que o Mercado Pago responde à nossa consulta vale.
@@ -165,7 +165,7 @@ async function handle(req, res) {
     res.writeHead(200, { ...HEAD, 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' }); return res.end(fs.readFileSync(f));
   }
   if (!p.startsWith('/api/')) return send(res, 404, { erro: 'Não encontrado.' });
-  if (m === 'GET' && p === '/api/health') return send(res, 200, { ok: true, app: 'curriculo-ia', mail: MAIL_ON, pay: !!MP_TOKEN });
+  if (m === 'GET' && p === '/api/health') return send(res, 200, { ok: true, app: 'curriculo-ia', mail: MAIL_ON, pay: !!MP_TOKEN, price: PRICE });
   if (m === 'POST' && p === '/api/pay/webhook') {
     let wb = {}; try { wb = await readBody(req, 100_000); } catch { /* ignora corpo ruim */ }
     const id = (wb.data && wb.data.id) || url.searchParams.get('data.id') || url.searchParams.get('id');
