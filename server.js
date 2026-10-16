@@ -7,7 +7,15 @@ const SECRET = env.APP_SECRET || (PROD ? '' : 'dev-secret-change-me-please-0123'
 if (SECRET.length < 24) { console.error('Defina APP_SECRET com 24+ caracteres.'); process.exit(1); }
 const MAIL_ON = !PROD || !!(env.RESEND_API_KEY && env.MAIL_FROM);
 if (!MAIL_ON) console.warn('AVISO: RESEND_API_KEY/MAIL_FROM ausentes. O login por e-mail fica desligado até você configurá-los.');
-const PRICE = +env.PRICE_CENTS || 1000, MP_API = env.MP_API || 'https://api.mercadopago.com', MP_TOKEN = env.MP_ACCESS_TOKEN || '', BASE = (env.BASE_URL || '').replace(/\/$/, '');
+// Aceita BASE_URL com aspas, espaços, barra no final ou sem https:// e devolve só o endereço limpo (ou vazio se for inválido)
+function normBase(v) {
+  v = String(v || '').trim().replace(/^["']|["']$/g, '').trim().replace(/\/+$/, '');
+  if (!v) return '';
+  if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+  try { return new URL(v).origin; } catch { return ''; }
+}
+const PRICE = +env.PRICE_CENTS || 1000, MP_API = env.MP_API || 'https://api.mercadopago.com', MP_TOKEN = env.MP_ACCESS_TOKEN || '', BASE = normBase(env.BASE_URL);
+if (env.BASE_URL && !BASE) console.warn('AVISO: BASE_URL inválida; o aviso automático de pagamento ficará desligado.');
 const ADMINS = (env.ADMIN_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const DB_PATH = env.DB_PATH || (env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(env.RAILWAY_VOLUME_MOUNT_PATH, 'app.db') : path.join(__dirname, 'data', 'app.db'));
 if (PROD && !env.DB_PATH && !env.RAILWAY_VOLUME_MOUNT_PATH) console.warn('ATENÇÃO: sem disco persistente configurado, o banco será apagado a cada publicação. Crie um volume e defina DB_PATH.');
