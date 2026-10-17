@@ -58,7 +58,9 @@ Configuração:
 
 Vendas: logado como administrador, `/api/admin/stats` mostra vendas e faturamento, e `/api/admin/orders` lista os pedidos.
 
-**Limite importante:** o PDF ainda é gerado no navegador do cliente. O servidor controla quando o botão aparece, o que impede o uso normal sem pagar, mas alguém que saiba mexer no código da página ainda consegue gerar o PDF sem passar pelo pagamento. A trava completa exige gerar o PDF no servidor depois da confirmação (e esse PDF teria texto selecionável). É o próximo passo recomendado.
+**PDF:** o site gera o PDF no próprio navegador, com um gerador próprio (sem bibliotecas externas): o arquivo é vetorial, tem texto selecionável (bom para sites de vagas) e costuma ter poucos KB.
+
+**Limite importante:** o PDF ainda é gerado no navegador do cliente. O servidor controla quando o botão aparece, o que impede o uso normal sem pagar, mas alguém que saiba mexer no código da página ainda consegue gerar o PDF sem passar pelo pagamento. A trava completa exige gerar o PDF no servidor depois da confirmação. É o próximo passo recomendado.
 
 ## Checklist de lançamento
 
