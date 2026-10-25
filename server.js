@@ -1,289 +1,151 @@
-'use strict';
-// Currículo IA – servidor sem dependências (Node >= 22.9). Contas por código de e-mail, rascunhos, contatos.
-const http = require('node:http'), fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
-const env = process.env, PROD = env.NODE_ENV === 'production' || !!env.RAILWAY_PROJECT_ID || !!env.RAILWAY_ENVIRONMENT_NAME; // na Railway sempre vale o modo de produção
-const SECRET = env.APP_SECRET || (PROD ? '' : 'dev-secret-change-me-please-0123');
-if (SECRET.length < 24) { console.error('Defina APP_SECRET com 24+ caracteres.'); process.exit(1); }
-const MAIL_ON = !PROD || !!(env.RESEND_API_KEY && env.MAIL_FROM);
-if (!MAIL_ON) console.warn('AVISO: RESEND_API_KEY/MAIL_FROM ausentes. O login por e-mail fica desligado até você configurá-los.');
-// Aceita BASE_URL com aspas, espaços, barra no final ou sem https:// e devolve só o endereço limpo (ou vazio se for inválido)
-function normBase(v) {
-  v = String(v || '').trim().replace(/^["']|["']$/g, '').trim().replace(/\/+$/, '');
-  if (!v) return '';
-  if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
-  try { return new URL(v).origin; } catch { return ''; }
+const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto'),os=require('os');
+const {DatabaseSync}=require('node:sqlite');
+const PORT=+process.env.PORT||3000,DIR=process.env.DATA||path.join(__dirname,'data');
+fs.mkdirSync(DIR,{recursive:true});
+const db=new DatabaseSync(path.join(DIR,'motel.db'));
+db.exec(`CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT);
+CREATE TABLE IF NOT EXISTS stays(id INTEGER PRIMARY KEY,suite TEXT NOT NULL,open INTEGER NOT NULL,d TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open ON stays(suite) WHERE open=1;
+CREATE TABLE IF NOT EXISTS sessions(t TEXT PRIMARY KEY,uid INTEGER,ts INTEGER);`);
+const get=(k,d)=>{const r=db.prepare('SELECT v FROM kv WHERE k=?').get(k);return r?JSON.parse(r.v):d};
+const set=(k,v)=>db.prepare('INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v').run(k,JSON.stringify(v));
+const hp=(p,s=crypto.randomBytes(8).toString('hex'))=>s+':'+crypto.scryptSync(p,s,32).toString('hex');
+const okp=(p,h)=>{const a=Buffer.from(hp(p,h.split(':')[0])),b=Buffer.from(h);return a.length==b.length&&crypto.timingSafeEqual(a,b)};
+const num=v=>Math.max(0,+v||0);
+const rp=()=>crypto.randomBytes(5).toString('hex'),AP=process.env.ADMIN_PASS||rp(),CP=process.env.CAIXA_PASS||rp();
+if(!get('suites')){
+ console.log('SENHAS INICIAIS -> admin: '+AP+'  |  caixa: '+CP);
+ set('tol',10);set('uid',3);
+ set('users',[{id:1,name:'Administrador',login:'admin',pass:hp(AP),role:'admin',on:1},{id:2,name:'Caixa',login:'caixa',pass:hp(CP),role:'func',on:1}]);
+ set('suites',[1,2,3,4,5,6].map(n=>({n:String(n).padStart(2,'0'),base:80,hours:2,extra:30,rule:'hora',st:'livre'})));
+ set('cats',['Bebidas','Comidas','Outros']);
+ set('prods',[['Cerveja','Bebidas',8],['Refrigerante','Bebidas',6],['Água','Bebidas',3],['Energético','Bebidas',12],['Lanche','Comidas',15],['Porção','Comidas',25]].map((p,i)=>({id:i+1,name:p[0],cat:p[1],price:p[2],on:1})));
 }
-const PRICE = +env.PRICE_CENTS || 1000, MP_API = env.MP_API || 'https://api.mercadopago.com', MP_TOKEN = env.MP_ACCESS_TOKEN || '', BASE = normBase(env.BASE_URL);
-if (env.BASE_URL && !BASE) console.warn('AVISO: BASE_URL inválida; o aviso automático de pagamento ficará desligado.');
-const ADMINS = (env.ADMIN_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-const DB_PATH = env.DB_PATH || (env.RAILWAY_VOLUME_MOUNT_PATH ? path.join(env.RAILWAY_VOLUME_MOUNT_PATH, 'app.db') : path.join(__dirname, 'data', 'app.db'));
-if (PROD && !env.DB_PATH && !env.RAILWAY_VOLUME_MOUNT_PATH) console.warn('ATENÇÃO: sem disco persistente configurado, o banco será apagado a cada publicação. Crie um volume e defina DB_PATH.');
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const db = new DatabaseSync(DB_PATH);
-db.exec(`pragma journal_mode=wal; pragma foreign_keys=on;
-create table if not exists users(id integer primary key, email text unique not null, created_at integer not null, consent_at integer not null, news integer not null default 0, news_at integer);
-create table if not exists codes(email text primary key, hash text not null, exp integer not null, tries integer not null default 0, consent integer not null, news integer not null);
-create table if not exists sessions(hash text primary key, user_id integer not null references users(id) on delete cascade, exp integer not null);
-create table if not exists resumes(user_id integer primary key references users(id) on delete cascade, data text not null, updated_at integer not null);
-create table if not exists orders(id text primary key, token_hash text not null, user_id integer, email text not null, amount_cents integer not null, status text not null, mp_id text, qr text, qr_b64 text, created_at integer not null, paid_at integer, uses_left integer not null default 0);
-create table if not exists rate(k text primary key, n integer not null, reset integer not null);`);
-
-// ---------- Backup ----------
-const BK_DIR = path.join(path.dirname(DB_PATH), 'backups');
-function snapshot() { // uma cópia por dia no próprio volume; mantém as 7 mais recentes
-  try {
-    fs.mkdirSync(BK_DIR, { recursive: true });
-    const f = path.join(BK_DIR, 'app-' + new Date().toISOString().slice(0, 10) + '.db');
-    if (!fs.existsSync(f)) db.prepare('VACUUM INTO ?').run(f);
-    fs.readdirSync(BK_DIR).filter(n => /^app-\d{4}-\d{2}-\d{2}\.db$/.test(n)).sort().slice(0, -7).forEach(n => fs.unlinkSync(path.join(BK_DIR, n)));
-  } catch (e) { console.error('backup:', e.message); }
-}
-const now = () => Date.now();
-const H = s => crypto.createHmac('sha256', SECRET).update(s).digest('hex');
-const same = (a, b) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
-const outbox = []; // só para desenvolvimento e testes
-
-function hit(k, max, win) { // limite simples por janela fixa
-  const t = now(), r = db.prepare('select n,reset from rate where k=?').get(k);
-  if (!r || r.reset < t) { db.prepare('insert or replace into rate(k,n,reset) values(?,?,?)').run(k, 1, t + win); return true; }
-  if (r.n >= max) return false;
-  db.prepare('update rate set n=n+1 where k=?').run(k); return true;
-}
-const ipOf = req => env.TRUST_PROXY === '1' ? (String(req.headers['x-forwarded-for'] || '').split(',').pop().trim() || req.socket.remoteAddress) : req.socket.remoteAddress;
-const normEmail = v => { const e = String(v || '').trim().toLowerCase(); return e.length <= 120 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : null; };
-
-async function sendMail(to, subject, text) {
-  if (env.RESEND_API_KEY) {
-    const r = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: 'Bearer ' + env.RESEND_API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ from: env.MAIL_FROM, to: [to], subject, text }) });
-    if (!r.ok) throw new Error('falha no envio de e-mail: ' + r.status);
-    return;
-  }
-  outbox.push({ to, subject, text }); console.log('[DEV e-mail para ' + to + ']', text.split('\n')[0]);
-}
-
-const HEAD = {
-  'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'X-Frame-Options': 'DENY',
-  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-  ...(PROD ? { 'Strict-Transport-Security': 'max-age=31536000; includeSubDomains' } : {})
-};
-function send(res, code, obj, extra = {}) {
-  const isStr = typeof obj === 'string';
-  res.writeHead(code, { ...HEAD, 'Cache-Control': 'no-store', 'Content-Type': isStr ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8', ...extra });
-  res.end(isStr ? obj : JSON.stringify(obj));
-}
-const cookies = req => Object.fromEntries((req.headers.cookie || '').split(';').map(c => c.trim().split(/=(.*)/s).slice(0, 2)).filter(a => a[0]));
-const userOf = req => { const t = cookies(req).cia_s; if (!/^[a-f0-9]{64}$/.test(t || '')) return null; return db.prepare('select u.* from sessions s join users u on u.id=s.user_id where s.hash=? and s.exp>?').get(H(t), now()) || null; };
-const cookie = (req, v, age) => `cia_s=${v}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${age}` + ((PROD || req.headers['x-forwarded-proto'] === 'https') ? '; Secure' : '');
-const sameOrigin = req => { const o = req.headers.origin; if (!o) return true; const h = req.headers.host; return o === 'http://' + h || o === 'https://' + h || (!!env.ORIGIN && o === env.ORIGIN); };
-function readBody(req, max = 1_000_000) {
-  return new Promise((ok, no) => {
-    let n = 0, big = false; const c = [];
-    req.on('data', x => { n += x.length; if (n > max) { big = true; if (n > max * 5) req.destroy(); } else c.push(x); });
-    req.on('end', () => { if (big) return no({ code: 413 }); try { ok(c.length ? JSON.parse(Buffer.concat(c)) : {}); } catch { no({ code: 400 }); } });
-    req.on('error', () => no({ code: 400 }));
-  });
-}
-const csv = v => { v = String(v ?? ''); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
-
-// ---------- Pagamento (Mercado Pago, Pix) ----------
-async function mp(method, p, body, idem) {
-  const r = await fetch(MP_API + p, { method, headers: { Authorization: 'Bearer ' + MP_TOKEN, 'Content-Type': 'application/json', ...(idem ? { 'X-Idempotency-Key': idem } : {}) }, body: body ? JSON.stringify(body) : undefined });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error('mercadopago ' + r.status + ' ' + JSON.stringify({ message: j.message, error: j.error, cause: j.cause }).slice(0, 400));
-  return j;
-}
-// Nunca confiamos no conteúdo do aviso: só o que o Mercado Pago responde à nossa consulta vale.
-function applyPayment(pay) {
-  const o = db.prepare('select * from orders where id=?').get(String(pay.external_reference || ''));
-  if (!o || (o.mp_id && String(o.mp_id) !== String(pay.id))) return 'ignorado';
-  if (pay.currency_id !== 'BRL' || Math.round(Number(pay.transaction_amount) * 100) !== o.amount_cents) return 'valor divergente';
-  if (!o.mp_id) db.prepare('update orders set mp_id=? where id=?').run(String(pay.id), o.id);
-  if (o.status === 'paid' && ['refunded', 'charged_back'].includes(pay.status)) { db.prepare("update orders set status='refunded',uses_left=0 where id=?").run(o.id); return 'estornado'; }
-  if (o.status !== 'pending') return 'já processado';
-  if (pay.status === 'approved') { db.prepare("update orders set status='paid',paid_at=?,uses_left=3 where id=?").run(now(), o.id); return 'pago'; }
-  if (['cancelled', 'rejected', 'expired'].includes(pay.status)) { db.prepare("update orders set status='failed' where id=?").run(o.id); return 'falhou'; }
-  return 'pendente';
-}
-const getOrder = id => db.prepare('select * from orders where id=?').get(id);
-function ordOf(req, id) {
-  const o = getOrder(String(id || '')), t = req.headers['x-order-token'];
-  return o && typeof t === 'string' && /^[a-f0-9]{64}$/.test(t) && same(o.token_hash, H(t)) ? o : null;
-}
-
-// ---------- Páginas legais (modelo inicial; revise com um profissional antes de divulgar) ----------
-const escH = v => String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const LEGAL = escH(env.LEGAL_NAME || '[preencha LEGAL_NAME]'), CONTACT = escH(env.CONTACT_EMAIL || '[preencha CONTACT_EMAIL]'), LDOC = env.LEGAL_DOC ? ' (' + escH(env.LEGAL_DOC) + ')' : '';
-if (PROD && !(env.LEGAL_NAME && env.CONTACT_EMAIL)) console.warn('AVISO: defina LEGAL_NAME e CONTACT_EMAIL; as páginas /privacidade e /termos mostram espaços em branco até lá.');
-const UPD = '10 de outubro de 2026';
-const page = (t, body) => `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${t} – Currículo IA</title><style>body{font:17px/1.65 system-ui,Arial,sans-serif;margin:0;color:#14213a;background:#fff}main{max-width:760px;margin:0 auto;padding:28px 20px 60px}h1{font-size:28px}h2{font-size:20px;margin-top:28px}a{color:#2F8FF0}.n{color:#5b6b82;font-size:15px}@media(prefers-color-scheme:dark){body{background:#0e1626;color:#e8eef8}.n{color:#9fb0c8}}</style></head><body><main><p><a href="/">← Voltar ao Currículo IA</a></p><h1>${t}</h1><p class="n">Atualizado em ${UPD}.</p>${body}</main></body></html>`;
-const PRIV = page('Política de Privacidade', `
-<p>O <b>Currículo IA</b> é operado por <b>${LEGAL}</b>${LDOC} (“nós”), que é o controlador dos seus dados pessoais. Contato para assuntos de privacidade: <a href="mailto:${CONTACT}">${CONTACT}</a>.</p>
-<h2>1. Quais dados tratamos</h2>
-<p><b>Dados do currículo</b>, que você digita: nome, telefone, WhatsApp, e-mail, cidade, endereço (opcional), objetivo, resumo, experiências, escolaridade, cursos, habilidades e foto (opcional). Pedimos só o necessário e nunca CPF ou RG.<br><b>Dados de conta</b>: seu e-mail, a data do seu aceite desta política e, se você marcar, a sua preferência de receber novidades.<br><b>Dados de pagamento</b>: o pagamento por Pix é processado pelo Mercado Pago. Guardamos o seu e-mail, o valor e o identificador do pagamento; não temos acesso a dados de cartão nem à sua conta bancária.<br><b>Dados técnicos</b>: o endereço de IP é usado para limitar abusos e proteger o serviço.</p>
-<h2>2. Para que usamos</h2>
-<p>Montar e entregar o seu currículo; guardar o seu rascunho na sua conta; confirmar o pagamento e liberar o download; enviar o código de acesso por e-mail; prevenir fraudes e abusos; e, <b>só se você marcou essa opção</b>, enviar novidades e promoções. Você pode retirar esse consentimento quando quiser.</p>
-<h2>3. Bases legais</h2>
-<p>Execução do serviço que você contratou, cumprimento de obrigações legais, legítimo interesse para segurança do serviço e, para novidades e promoções, o seu consentimento.</p>
-<h2>4. Com quem compartilhamos</h2>
-<p>Apenas com prestadores necessários ao serviço: Mercado Pago (pagamentos), Resend (envio de e-mails) e Railway (hospedagem). Esses prestadores podem processar dados em outros países. Não vendemos seus dados.</p>
-<h2>5. Cookies e armazenamento no navegador</h2>
-<p>Usamos um cookie essencial para manter você conectado à conta e armazenamento do navegador para guardar o rascunho neste aparelho. Não usamos cookies de publicidade.</p>
-<h2>6. Por quanto tempo guardamos</h2>
-<p>O rascunho e a conta ficam guardados enquanto a conta existir; você pode excluí-la a qualquer momento pelo botão “Excluir minha conta”, o que apaga o rascunho. Registros de pagamento podem ser mantidos pelo tempo necessário para cumprir obrigações legais e fiscais.</p>
-<h2>7. Seus direitos</h2>
-<p>Pela LGPD você pode pedir confirmação de que tratamos seus dados, acesso, correção, anonimização ou eliminação, portabilidade, informação sobre compartilhamentos e revogação do consentimento. Escreva para <a href="mailto:${CONTACT}">${CONTACT}</a>. Você também pode reclamar à Autoridade Nacional de Proteção de Dados (ANPD).</p>
-<h2>8. Segurança</h2>
-<p>Adotamos medidas como conexão criptografada, códigos de acesso de uso único, limites de tentativas e acesso restrito aos dados. Nenhum sistema é 100% seguro, e por isso recomendamos não incluir no currículo dados que você não queira divulgar.</p>
-<h2>9. Menores de 18 anos</h2>
-<p>Se você tem menos de 18 anos, peça a um responsável para ajudar a usar o serviço.</p>
-<h2>10. Mudanças</h2>
-<p>Podemos atualizar esta política. A data de atualização fica no início da página.</p>`);
-const TERMS = page('Termos de Uso', `
-<p>Ao usar o <b>Currículo IA</b>, operado por <b>${LEGAL}</b>${LDOC}, você concorda com estes termos. Dúvidas: <a href="mailto:${CONTACT}">${CONTACT}</a>.</p>
-<h2>1. O serviço</h2>
-<p>O Currículo IA ajuda você a montar um currículo em PDF a partir das informações que você mesmo preenche. Não inventamos experiências, cursos ou qualificações: o conteúdo é de sua responsabilidade e deve ser verdadeiro.</p>
-<h2>2. Preço e pagamento</h2>
-<p>O valor é de R$ 10,00 por currículo, pago por Pix. O download é liberado depois da confirmação do pagamento. Cada pedido pago permite até 3 downloads do currículo.</p>
-<h2>3. Problemas e reembolso</h2>
-<p>Se o pagamento foi confirmado e você não conseguiu baixar o currículo, fale com a gente pelo WhatsApp ou pelo e-mail acima para resolvermos. Pedidos de reembolso e o direito de arrependimento seguem a legislação de defesa do consumidor aplicável.</p>
-<h2>4. Uso adequado</h2>
-<p>Não use o serviço para conteúdo ilegal, ofensivo ou de terceiros sem autorização, nem tente burlar o pagamento ou prejudicar o funcionamento do site.</p>
-<h2>5. Sem garantia de resultado</h2>
-<p>O currículo é uma ferramenta de apresentação. Não garantimos entrevistas, contratações ou que o arquivo seja aceito por todos os sistemas de candidatura.</p>
-<h2>6. Disponibilidade</h2>
-<p>Buscamos manter o serviço sempre no ar, mas ele pode ficar indisponível para manutenção ou por falhas de terceiros.</p>
-<h2>7. Dados pessoais</h2>
-<p>O tratamento dos seus dados está descrito na <a href="/privacidade">Política de Privacidade</a>.</p>
-<h2>8. Mudanças e foro</h2>
-<p>Podemos alterar estes termos, e a versão vigente é a publicada nesta página. Aplicam-se as leis brasileiras.</p>`);
-const html = (res, body) => { res.writeHead(200, { ...HEAD, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' }); res.end(body); };
-const isAdmin = u => !!u && ADMINS.includes(u.email);
-
-async function handle(req, res) {
-  const url = new URL(req.url, 'http://x'), p = url.pathname, m = req.method;
-  if (m === 'GET' && (p === '/' || p === '/index.html')) {
-    const f = path.join(__dirname, 'public', 'index.html');
-    return html(res, fs.readFileSync(f, 'utf8').split('%%BASE%%').join(BASE));
-  }
-  if (m === 'GET' && p === '/privacidade') return html(res, PRIV);
-  if (m === 'GET' && p === '/termos') return html(res, TERMS);
-  if (m === 'GET' && p === '/og.png') {
-    const f = path.join(__dirname, 'public', 'og.png'); if (!fs.existsSync(f)) return send(res, 404, { erro: 'Não encontrado.' });
-    res.writeHead(200, { ...HEAD, 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' }); return res.end(fs.readFileSync(f));
-  }
-  if (!p.startsWith('/api/')) return send(res, 404, { erro: 'Não encontrado.' });
-  if (m === 'GET' && p === '/api/health') return send(res, 200, { ok: true, app: 'curriculo-ia', mail: MAIL_ON, pay: !!MP_TOKEN, price: PRICE });
-  if (m === 'POST' && p === '/api/pay/webhook') {
-    let wb = {}; try { wb = await readBody(req, 100_000); } catch { /* ignora corpo ruim */ }
-    const id = (wb.data && wb.data.id) || url.searchParams.get('data.id') || url.searchParams.get('id');
-    if (!MP_TOKEN || !/^\d{1,20}$/.test(String(id || ''))) return send(res, 200, { ok: true });
-    if (!hit('wh:' + ipOf(req), 300, 3600e3)) return send(res, 429, { erro: 'Muitas requisições.' });
-    try { applyPayment(await mp('GET', '/v1/payments/' + id)); } catch (e) { console.error('webhook:', e.message); return send(res, 500, { erro: 'Tente de novo.' }); }
-    return send(res, 200, { ok: true });
-  }
-  if (m !== 'GET' && !sameOrigin(req)) return send(res, 403, { erro: 'Origem não permitida.' });
-  let b = {};
-  if (m === 'POST' || m === 'PUT') {
-    if (!/application\/json/.test(req.headers['content-type'] || '')) return send(res, 415, { erro: 'Envie JSON.' });
-    try { b = await readBody(req); } catch (e) { return send(res, e.code || 400, { erro: e.code === 413 ? 'Arquivo grande demais.' : 'Requisição inválida.' }); }
-  }
-  const ip = ipOf(req);
-
-  if (m === 'POST' && p === '/api/auth/request') {
-    const email = normEmail(b.email);
-    if (!email) return send(res, 400, { erro: 'E-mail inválido.' });
-    if (b.consent !== true) return send(res, 400, { erro: 'Aceite a política de privacidade para continuar.' });
-    if (!MAIL_ON) return send(res, 503, { erro: 'O login por e-mail ainda não está disponível.' });
-    if (!hit('ip:' + ip, 20, 3600e3) || !hit('em:' + email, 5, 3600e3)) return send(res, 429, { erro: 'Muitas tentativas. Tente novamente mais tarde.' });
-    const code = String(crypto.randomInt(0, 1e6)).padStart(6, '0');
-    db.prepare('insert or replace into codes(email,hash,exp,tries,consent,news) values(?,?,?,0,1,?)').run(email, H(email + ':' + code), now() + 600e3, b.news === true ? 1 : 0);
-    try { await sendMail(email, 'Seu código do Currículo IA', `Seu código do Currículo IA: ${code}\n\nEle vale por 10 minutos. Se você não pediu este código, ignore esta mensagem.`); }
-    catch (e) { console.error(e.message); return send(res, 502, { erro: 'Não foi possível enviar o e-mail agora. Tente de novo.' }); }
-    return send(res, 200, { ok: true });
-  }
-  if (m === 'POST' && p === '/api/auth/verify') {
-    const email = normEmail(b.email), code = String(b.code || '');
-    if (!email || !/^\d{6}$/.test(code)) return send(res, 400, { erro: 'Código inválido ou expirado.' });
-    if (!hit('v:' + ip, 30, 3600e3)) return send(res, 429, { erro: 'Muitas tentativas. Tente novamente mais tarde.' });
-    const row = db.prepare('select * from codes where email=?').get(email), bad = { erro: 'Código inválido ou expirado.' };
-    if (!row || row.exp < now()) return send(res, 400, bad);
-    if (row.tries >= 5) { db.prepare('delete from codes where email=?').run(email); return send(res, 400, { erro: 'Muitas tentativas. Peça um novo código.' }); }
-    if (!same(row.hash, H(email + ':' + code))) { db.prepare('update codes set tries=tries+1 where email=?').run(email); return send(res, 400, bad); }
-    db.prepare('delete from codes where email=?').run(email);
-    const t = now(); let u = db.prepare('select * from users where email=?').get(email);
-    if (!u) { db.prepare('insert into users(email,created_at,consent_at,news,news_at) values(?,?,?,?,?)').run(email, t, t, row.news, row.news ? t : null); u = db.prepare('select * from users where email=?').get(email); }
-    else if (row.news && !u.news) { db.prepare('update users set news=1,news_at=? where id=?').run(t, u.id); u.news = 1; }
-    const tok = crypto.randomBytes(32).toString('hex');
-    db.prepare('insert into sessions(hash,user_id,exp) values(?,?,?)').run(H(tok), u.id, t + 30 * 864e5);
-    return send(res, 200, { ok: true, email: u.email, news: !!u.news }, { 'Set-Cookie': cookie(req, tok, 30 * 86400) });
-  }
-  if (m === 'POST' && p === '/api/pay/create') {
-    if (!MP_TOKEN) return send(res, 503, { erro: 'Pagamento ainda não configurado.' });
-    const email = normEmail(b.email); if (!email) return send(res, 400, { erro: 'E-mail inválido.' });
-    if (!hit('pay:' + ip, 10, 3600e3)) return send(res, 429, { erro: 'Muitas tentativas. Tente novamente mais tarde.' });
-    const cu = userOf(req), id = crypto.randomBytes(8).toString('hex'), token = crypto.randomBytes(32).toString('hex');
-    db.prepare("insert into orders(id,token_hash,user_id,email,amount_cents,status,created_at) values(?,?,?,?,?,'pending',?)").run(id, H(token), cu ? cu.id : null, email, PRICE, now());
-    try {
-      const pay = await mp('POST', '/v1/payments', { transaction_amount: PRICE / 100, description: 'Currículo IA', payment_method_id: 'pix', payer: { email }, external_reference: id, ...(BASE ? { notification_url: BASE + '/api/pay/webhook' } : {}) }, id);
-      const td = (pay.point_of_interaction && pay.point_of_interaction.transaction_data) || {};
-      if (!pay.id || !td.qr_code) throw new Error('resposta sem Pix');
-      db.prepare('update orders set mp_id=?,qr=?,qr_b64=? where id=?').run(String(pay.id), td.qr_code, td.qr_code_base64 || '', id);
-      return send(res, 200, { order: id, token, qr: td.qr_code, qr_b64: td.qr_code_base64 || '', amount: PRICE });
-    } catch (e) { console.error('criar Pix:', e.message); db.prepare('delete from orders where id=?').run(id); return send(res, 502, { erro: 'Não foi possível gerar o Pix agora. Tente de novo.' }); }
-  }
-  if (m === 'GET' && p === '/api/pay/status') {
-    let o = ordOf(req, url.searchParams.get('order')); if (!o) return send(res, 401, { erro: 'Pedido não encontrado.' });
-    if (o.status === 'pending' && o.mp_id && hit('st:' + o.id, 40, 60e3)) { try { applyPayment(await mp('GET', '/v1/payments/' + o.mp_id)); o = getOrder(o.id); } catch (e) { console.error('status:', e.message); } }
-    return send(res, 200, { status: o.status, uses_left: o.uses_left });
-  }
-  if (m === 'POST' && p === '/api/pay/consume') {
-    const o = ordOf(req, b.order); if (!o) return send(res, 401, { erro: 'Pedido não encontrado.' });
-    if (o.status !== 'paid' || o.uses_left < 1) return send(res, 409, { erro: 'Download não liberado.' });
-    db.prepare('update orders set uses_left=uses_left-1 where id=?').run(o.id); return send(res, 200, { uses_left: o.uses_left - 1 });
-  }
-  const u = userOf(req);
-  if (m === 'POST' && p === '/api/logout') { const t = cookies(req).cia_s; if (t) db.prepare('delete from sessions where hash=?').run(H(t)); return send(res, 200, { ok: true }, { 'Set-Cookie': cookie(req, '', 0) }); }
-  if (!u) return send(res, 401, { erro: 'Entre na sua conta.' });
-  if (m === 'GET' && p === '/api/me') return send(res, 200, { email: u.email, news: !!u.news, admin: isAdmin(u) });
-  if (m === 'POST' && p === '/api/me/prefs') { const n = b.news === true ? 1 : 0; db.prepare('update users set news=?,news_at=? where id=?').run(n, n ? now() : null, u.id); return send(res, 200, { ok: true, news: !!n }); }
-  if (m === 'DELETE' && p === '/api/me') { db.prepare('delete from users where id=?').run(u.id); return send(res, 200, { ok: true }, { 'Set-Cookie': cookie(req, '', 0) }); }
-  if (m === 'GET' && p === '/api/resume') { const r = db.prepare('select data from resumes where user_id=?').get(u.id); return send(res, 200, r ? JSON.parse(r.data) : {}); }
-  if (m === 'PUT' && p === '/api/resume') {
-    if (!b.d || typeof b.d !== 'object' || Array.isArray(b.d)) return send(res, 400, { erro: 'Dados inválidos.' });
-    if (!hit('r:' + u.id, 120, 3600e3)) return send(res, 429, { erro: 'Muitas gravações. Aguarde um pouco.' });
-    const data = JSON.stringify({ t: String(b.t || '').slice(0, 30), d: b.d });
-    if (data.length > 900_000) return send(res, 413, { erro: 'Arquivo grande demais.' });
-    db.prepare('insert or replace into resumes(user_id,data,updated_at) values(?,?,?)').run(u.id, data, now()); return send(res, 200, { ok: true });
-  }
-  if (p.startsWith('/api/admin/')) {
-    if (!isAdmin(u)) return send(res, 403, { erro: 'Sem permissão.' });
-    if (m === 'GET' && p === '/api/admin/stats') return send(res, 200, db.prepare("select (select count(*) from users) usuarios, (select count(*) from users where news=1) aceitaram_novidades, (select count(*) from resumes) rascunhos, (select count(*) from orders where status='paid') vendas, (select coalesce(sum(amount_cents),0) from orders where status='paid') faturamento_centavos").get());
-    if (m === 'GET' && p === '/api/admin/orders') return send(res, 200, db.prepare('select id,email,status,amount_cents,created_at,paid_at,uses_left from orders order by created_at desc limit 200').all());
-    if (m === 'GET' && p === '/api/admin/backup') { // baixa uma cópia consistente do banco (contém dados pessoais: guarde com cuidado)
-      if (!hit('bk:' + u.id, 6, 3600e3)) return send(res, 429, { erro: 'Muitos downloads. Tente mais tarde.' });
-      fs.mkdirSync(BK_DIR, { recursive: true });
-      const f = path.join(BK_DIR, 'dl-' + crypto.randomBytes(6).toString('hex') + '.db');
-      db.prepare('VACUUM INTO ?').run(f); const buf = fs.readFileSync(f); fs.unlinkSync(f);
-      res.writeHead(200, { ...HEAD, 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="curriculo-ia-backup-${new Date().toISOString().slice(0, 10)}.db"`, 'Cache-Control': 'no-store' });
-      return res.end(buf);
-    }
-    if (m === 'GET' && p === '/api/admin/contacts.csv') {
-      const all = url.searchParams.get('all') === '1';
-      const rows = db.prepare('select email,created_at,news from users ' + (all ? '' : 'where news=1 ') + 'order by created_at').all();
-      return send(res, 200, 'email,criado_em,aceitou_novidades\n' + rows.map(r => [csv(r.email), new Date(r.created_at).toISOString(), r.news ? 'sim' : 'nao'].join(',')).join('\n') + '\n', { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="contatos.csv"' });
-    }
-  }
-  return send(res, 404, { erro: 'Não encontrado.' });
-}
-
-function start(port = +env.PORT || 3000) {
-  const srv = http.createServer((req, res) => handle(req, res).catch(e => { console.error('erro:', e.message); if (!res.headersSent) send(res, 500, { erro: 'Erro interno.' }); }));
-  const t = now();
-  const clean = () => { const x = now(); db.prepare('delete from codes where exp<?').run(x); db.prepare('delete from sessions where exp<?').run(x); db.prepare('delete from rate where reset<?').run(x); };
-  clean(); setInterval(clean, 3600e3).unref();
-  snapshot(); setInterval(snapshot, 6 * 3600e3).unref();
-  return new Promise(ok => srv.listen(port, () => { if (require.main === module) console.log('Currículo IA em http://localhost:' + srv.address().port); ok(srv); }));
-}
-module.exports = { start, outbox };
-if (require.main === module) start();
+const VALS=[30,31,34,37,41,44,47,50,53,54,55,56,57,59,62,63,65,67,69,73,77,79,81,82,83,85,88,90,94,96,100,102,103,104,105,106,111,114,116,118,119,120,122,124,126,130,132,134,136,138,140,142,143,146,148,149,150,151,153,154,155,159,161,163,165,169,173,175,178,180,181,184,185,186,187,188,189,190,191,192,193,194,195,197,199,201,203,204,205,206,207,208,212,218,222,228,230,232,235,236,238,240,242,244,246,248,250,255,257];
+if(!get('tabs'))set('tabs',[{id:'t1',name:'Tabela 1',rows:VALS.map((v,i)=>[60+5*i,v])}]);
+const VIPV=[50,54,57,62,65,70,75,79,83,87,90,95,100,105,110,113,119,122,125,130,135,140,144,148,150,155,160,163,169,173,175,180,185,188,193,198,200,205,210,215,218,223,225,230,235,238,243,248,250,255,260,265,268,272,275,280,285,288,293,298,300,305,312,315,318,323,325,330,335,338,343,348,350,355,360,365,368,373,375,380,385,390,393,398,400,405,410,415,418,423,425,430,435,440,443,448,450,455,460,465,468,473,475,480,485,490,493,498,500];
+{const ts=get('tabs',[]);if(!ts.some(t=>t.id=='vip')){ts.push({id:'vip',name:'Tabela VIP',rows:VIPV.map((v,i)=>[60+5*i,v])});set('tabs',ts)}}
+const tabPrice=(s,m)=>{const t=s.tab||[];if(!t.length)return s.base;const last=t[t.length-1];if(m>last[0]){const p=t.filter(x=>x[0]<=last[0]-60).pop(),sl=p?last[1]-p[1]:0;return last[1]+sl*Math.ceil((m-last[0])/60)}const r=t.find(x=>x[0]>=m);return r?r[1]:last[1]};
+const snap=x=>{if(x.rule!='tabela')return{base:x.base,hours:x.hours,extra:x.extra,rule:x.rule};const t=get('tabs',[]).find(y=>y.id==x.tab);if(!t||!t.rows.length)return null;return{base:t.rows[0][1],hours:t.rows[0][0]/60,extra:x.extra,rule:'tabela',tab:t.rows}};
+const NOTAB='Esta suíte usa tabela de preços, mas nenhuma tabela foi escolhida (Admin > Suítes).';
+const TTL=432e5,fails={};
+const cookie=r=>(/(?:^|; )sid=([a-f0-9]+)/.exec(r.headers.cookie||'')||[])[1];
+const who=r=>{const t=cookie(r);if(!t)return null;const s=db.prepare('SELECT uid,ts FROM sessions WHERE t=?').get(t);if(!s||Date.now()-s.ts>TTL)return null;const u=get('users').find(x=>x.id==s.uid);return u&&u.on?u:null};
+const send=(res,c,o,h={})=>{res.writeHead(c,{'Content-Type':'application/json',...h});res.end(JSON.stringify(o))};
+const body=req=>new Promise(r=>{let b='';req.on('data',c=>{b+=c;if(b.length>1e6)req.destroy()});req.on('end',()=>{try{r(JSON.parse(b||'{}'))}catch(e){r({})}})});
+const allStays=()=>db.prepare('SELECT d FROM stays ORDER BY id').all().map(r=>JSON.parse(r.d));
+const saveStay=s=>db.prepare('UPDATE stays SET open=?,d=? WHERE id=?').run(s.end?0:1,JSON.stringify(s),s.id);
+const getStay=id=>{const r=db.prepare('SELECT d FROM stays WHERE id=? AND open=1').get(+id);return r&&JSON.parse(r.d)};
+const r2=n=>+n.toFixed(2);
+const calcS=s=>{const m=Math.max(0,Math.round((s.end-s.start)/6e4)),ex=Math.max(0,m-s.hours*60-get('tol',10)),h=s.rule=='meia',u=ex?Math.ceil(ex/(h?30:60)):0,add=s.extra*u/(h?2:1),cons=Object.values(s.items).reduce((a,i)=>a+i.q*i.p,0);const host=s.rule=='tabela'?tabPrice(s,m):s.base+add;return{host,cons,total:host+cons}};
+const shiftCalc=()=>{const c=get('closes',[]),since=c.length?c[c.length-1].at:0,now=Date.now(),l=allStays().filter(s=>s.end&&!s.cancel&&s.end>since&&s.end<=now).map(s=>({s,k:calcS(s)})),sum=f=>r2(l.reduce((a,x)=>a+f(x),0)),by=m=>sum(x=>x.s.pay==m?x.k.total:0);const agg={};l.forEach(x=>Object.entries(x.s.items).forEach(([id,i])=>{const a=agg[id]||(agg[id]={n:i.n,q:0,v:0});a.q+=i.q;a.v=r2(a.v+i.q*i.p)}));
+const items=Object.values(agg).sort((a,b)=>b.q-a.q||a.n.localeCompare(b.n)),openQ=allStays().filter(s=>!s.end).reduce((a,s)=>a+Object.values(s.items).reduce((b,i)=>b+i.q,0),0);
+return{since,now,items,openQ,cnt:l.length,pix:by('PIX'),cash:by('Dinheiro'),card:by('Cartão'),host:sum(x=>x.k.host),cons:sum(x=>x.k.cons),total:sum(x=>x.k.total),float:get('float',0)}};
+function autoBackup(){try{const d=path.join(DIR,'backups');fs.mkdirSync(d,{recursive:true});const n=new Date().toISOString().slice(0,13).replace(/[-:T]/g,'');db.exec(`VACUUM INTO '${path.join(d,'motel-'+n+'.db').replace(/'/g,"''")}'`);fs.readdirSync(d).sort().slice(0,-28).forEach(f=>fs.rmSync(path.join(d,f)))}catch(e){}}
+autoBackup();setInterval(autoBackup,216e5);
+http.createServer(async(req,res)=>{try{
+ const u=req.url.split('?')[0];
+ if(!u.startsWith('/api/')){
+  const f=u=='/'?'index.html':u.slice(1);
+  if(!['index.html','api-layer.js'].includes(f)){res.writeHead(404);return res.end()}
+  res.writeHead(200,{'Content-Type':f.endsWith('.js')?'text/javascript; charset=utf-8':'text/html; charset=utf-8'});
+  return res.end(fs.readFileSync(path.join(__dirname,'public',f)));
+ }
+ const b=req.method=='POST'?await body(req):{};
+ if(u=='/api/login'){
+  const ip=(process.env.RAILWAY_ENVIRONMENT&&req.headers['x-forwarded-for']||req.socket.remoteAddress).split(',')[0].trim(),f=fails[ip]||(fails[ip]={n:0,t:0});
+  if(f.n>=8&&Date.now()-f.t<6e5)return send(res,429,{error:'Muitas tentativas. Aguarde alguns minutos.'});
+  const us=get('users').find(x=>x.login==String(b.login||'').trim());
+  if(!us||!okp(String(b.pass||''),us.pass)){f.n++;f.t=Date.now();return send(res,401,{error:'Usuário ou senha incorretos.'})}
+  if(!us.on)return send(res,403,{error:'Usuário bloqueado. Fale com o administrador.'});
+  f.n=0;const t=crypto.randomBytes(24).toString('hex');
+  db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(t,us.id,Date.now());
+  db.prepare('DELETE FROM sessions WHERE ts<?').run(Date.now()-TTL);
+  return send(res,200,{},{'Set-Cookie':`sid=${t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${req.headers['x-forwarded-proto']=='https'?'; Secure':''}`});
+ }
+ const me=who(req);
+ if(!me)return send(res,401,{error:'Sessão expirada. Entre novamente.'});
+ if(u=='/api/logout'){db.prepare('DELETE FROM sessions WHERE t=?').run(cookie(req));return send(res,200,{})}
+ if(u=='/api/backup'){
+  if(me.role!='admin')return send(res,403,{error:'Somente o administrador pode baixar o backup.'});
+  const f=path.join(DIR,'export.db');fs.rmSync(f,{force:true});db.exec(`VACUUM INTO '${f.replace(/'/g,"''")}'`);const buf=fs.readFileSync(f);fs.rmSync(f);
+  res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="motel-me-leve-backup.db"'});return res.end(buf);
+ }
+ if(u=='/api/shift')return send(res,200,shiftCalc());
+ if(u=='/api/float'){if(me.role!='admin')return send(res,403,{error:'Somente o administrador pode alterar o fundo de troco.'});set('float',num(b.v));return send(res,200,{})}
+ if(u=='/api/close'){
+  const c=shiftCalc(),counted=Number(b.counted);
+  if(!Number.isFinite(counted)||counted<0)return send(res,400,{error:'Informe o dinheiro contado na gaveta.'});
+  if(!c.cnt)return send(res,409,{error:'Nenhuma venda desde o último fechamento.'});
+  const list=get('closes',[]),expected=r2(c.float+c.cash),rec={id:list.length+1,by:me.name,at:c.now,from:c.since,cnt:c.cnt,pix:c.pix,cash:c.cash,card:c.card,host:c.host,cons:c.cons,total:c.total,float:c.float,items:c.items,expected,counted:r2(counted),diff:r2(counted-expected),note:String(b.note||'').slice(0,120)};
+  list.push(rec);set('closes',list);return send(res,200,rec);
+ }
+ if(u=='/api/state')return send(res,200,{me:{id:me.id,name:me.name,role:me.role},tol:get('tol'),suites:get('suites'),cats:get('cats'),prods:get('prods'),tabs:get('tabs',[]),users:me.role=='admin'?get('users').map(({pass,...x})=>({...x,pass:''})):[],stays:allStays(),closes:me.role=='admin'?get('closes',[]).slice(-60).reverse():[]});
+ if(u=='/api/start'){
+  const su=get('suites'),x=su.find(y=>y.n==b.suite);
+  if(!x||x.st!='livre')return send(res,409,{error:'Esta suíte não está livre.'});
+  const sn=snap(x);if(!sn)return send(res,409,{error:NOTAB});
+  const s={suite:x.n,start:Date.now(),end:0,...sn,items:{},user:me.name,pay:''};
+  let id;try{id=Number(db.prepare('INSERT INTO stays(suite,open,d) VALUES(?,1,?)').run(x.n,'{}').lastInsertRowid)}catch(e){return send(res,409,{error:'Esta suíte já tem uma estadia aberta.'})}
+  s.id=id;saveStay(s);x.st='ocupada';set('suites',su);return send(res,200,{id});
+ }
+ if(u=='/api/qty'){
+  const d=b.d>0?1:-1,s=getStay(b.stay),p=get('prods').find(x=>x.id==b.prod);
+  if(!s||!p||(d>0&&!p.on))return send(res,404,{error:'Comanda ou produto não encontrado.'});
+  const i=s.items[p.id]||(s.items[p.id]={q:0,p:p.price,n:p.name});i.q=Math.max(0,i.q+d);if(!i.q)delete s.items[p.id];
+  saveStay(s);return send(res,200,{});
+ }
+ if(u=='/api/pay'){
+  const s=getStay(b.stay);
+  if(!s||!['PIX','Dinheiro','Cartão'].includes(b.method))return send(res,409,{error:'Esta comanda já foi encerrada ou não existe.'});
+  s.end=Date.now();s.pay=b.method;s.user=me.name;saveStay(s);
+  const su=get('suites');su.find(x=>x.n==s.suite).st='limpeza';set('suites',su);return send(res,200,{});
+ }
+ if(u=='/api/cancel'){
+  const r=db.prepare('SELECT d FROM stays WHERE id=?').get(+b.stay),s=r&&JSON.parse(r.d);
+  if(!s||s.cancel)return send(res,404,{error:'Comanda não encontrada ou já cancelada.'});
+  if(me.role!='admin'&&(s.end||Object.keys(s.items).length))return send(res,403,{error:'Somente o administrador pode cancelar esta comanda.'});
+  const wasOpen=!s.end;s.cancel={by:me.name,at:Date.now(),why:String(b.why||'').slice(0,120)};if(wasOpen)s.end=Date.now();saveStay(s);
+  if(wasOpen){const su=get('suites'),x=su.find(y=>y.n==s.suite);if(x&&x.st=='ocupada'){x.st='livre';set('suites',su)}}
+  return send(res,200,{});
+ }
+ if(u=='/api/transfer'){
+  const s=getStay(b.stay),su=get('suites'),to=su.find(x=>x.n==b.to),from=s&&su.find(x=>x.n==s.suite);
+  if(!s||!to||!from)return send(res,404,{error:'Comanda ou suíte não encontrada.'});
+  if(to.st!='livre'||to.n==s.suite)return send(res,409,{error:'A suíte de destino não está livre.'});
+  const old=s.suite,nova=b.rate=='nova';s.suite=to.n;
+  if(nova){const sn=snap(to);if(!sn)return send(res,409,{error:NOTAB});Object.assign(s,sn);if(!sn.tab)delete s.tab}
+  (s.moves||(s.moves=[])).push({from:old,to:to.n,at:Date.now(),by:me.name,rate:nova?'nova':'manter'});
+  try{db.prepare('UPDATE stays SET suite=?,d=? WHERE id=?').run(s.suite,JSON.stringify(s),s.id)}catch(e){return send(res,409,{error:'A suíte de destino já está ocupada.'})}
+  from.st='limpeza';to.st='ocupada';set('suites',su);return send(res,200,{});
+ }
+ if(u=='/api/entry'){
+  const s=getStay(b.stay),t=Number(b.t),now=Date.now();
+  if(!s)return send(res,404,{error:'Comanda não encontrada ou já encerrada.'});
+  if(!Number.isFinite(t)||t>now+6e4||t<now-864e5-6e4)return send(res,400,{error:'Horário inválido. Use um horário das últimas 24 horas.'});
+  (s.edits||(s.edits=[])).push({from:s.start,to:Math.min(t,now),by:me.name,at:now,why:String(b.why||'').slice(0,120)});s.start=Math.min(t,now);saveStay(s);return send(res,200,{});
+ }
+ if(u=='/api/suite'){
+  const su=get('suites'),x=su.find(y=>y.n==b.n);
+  if(!x||x.st=='ocupada'||!['livre','limpeza','manut'].includes(b.st))return send(res,409,{error:'Não foi possível alterar esta suíte.'});
+  if(me.role!='admin'&&!(x.st=='limpeza'&&b.st=='livre'))return send(res,403,{error:'Somente o administrador pode fazer isso.'});
+  x.st=b.st;set('suites',su);return send(res,200,{});
+ }
+ if(u=='/api/config'){
+  if(me.role!='admin')return send(res,403,{error:'Somente o administrador pode alterar configurações.'});
+  const old=get('suites'),ns=(b.suites||[]).map(x=>{const o=old.find(y=>y.n==x.n);return{n:String(x.n),base:num(x.base),hours:num(x.hours),extra:num(x.extra),rule:['meia','tabela'].includes(x.rule)?x.rule:'hora',tab:String(x.tab||''),vip:x.vip?1:0,st:!o?'livre':(o.st=='ocupada'||x.st=='ocupada')?o.st:['livre','limpeza','manut'].includes(x.st)?x.st:o.st}});
+  old.forEach(o=>{if(!ns.some(x=>x.n==o.n))ns.push(o)});set('suites',ns);
+  set('cats',[...new Set((b.cats||[]).map(c=>String(c).trim()).filter(Boolean))]);
+  set('prods',(b.prods||[]).map(p=>({id:+p.id,name:String(p.name).slice(0,60),cat:String(p.cat),price:num(p.price),on:p.on?1:0})));
+  if(Array.isArray(b.tabs))set('tabs',b.tabs.map(t=>({id:String(t.id||'t'+Date.now()+Math.floor(Math.random()*1e3)),name:String(t.name||'Tabela').slice(0,40),rows:(t.rows||[]).map(r=>[Math.max(0,Math.round(+r[0]||0)),num(r[1])]).filter(r=>r[0]>0).sort((a,b)=>a[0]-b[0])})));
+  const ou=get('users');let uid=get('uid');
+  const nu=(b.users||[]).map(x=>{const o=ou.find(y=>y.id==x.id),id=o?o.id:uid++;return{id,name:String(x.name).slice(0,60),login:String(x.login).trim(),role:x.role=='admin'?'admin':'func',on:x.on?1:0,pass:x.pass?hp(String(x.pass)):o?o.pass:hp('1234')}});
+  const self=nu.find(x=>x.id==me.id);if(self){self.on=1;self.role='admin'}else nu.push(ou.find(x=>x.id==me.id));
+  set('users',nu);set('uid',uid);return send(res,200,{});
+ }
+ send(res,404,{error:'Não encontrado.'});
+}catch(e){console.error(e);try{send(res,500,{error:'Erro interno.'})}catch(_){}}}).listen(PORT,'0.0.0.0',()=>{
+ console.log('Motel Me Leve rodando. Deixe esta janela aberta.');
+ console.log('Neste computador: http://localhost:'+PORT);
+ Object.values(os.networkInterfaces()).flat().filter(i=>i.family=='IPv4'&&!i.internal).forEach(i=>console.log('Outros aparelhos na rede: http://'+i.address+':'+PORT));
+});
